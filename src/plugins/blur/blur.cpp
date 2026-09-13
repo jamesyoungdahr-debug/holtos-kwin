@@ -36,6 +36,7 @@
 #include <QTime>
 #include <QTimer>
 #include <QWindow>
+#include <algorithm> // std::clamp
 #include <cmath> // for ceil()
 #include <cstdlib>
 
@@ -57,10 +58,31 @@ namespace KWin
 
 static const QByteArray s_blurAtomName = QByteArrayLiteral("_KDE_NET_WM_BLUR_BEHIND_REGION");
 
-static QMatrix4x4 colorTransformMatrix(qreal saturation, qreal contrast)
+// The shader applies this as `color * matrix` (row vector), so scaling
+// lives on the diagonal and any additive term goes in the LAST ROW.
+// HoltOS additions over the stock effect: brightness (scale) and a tint —
+// the blurred background is blended towards tintColor by tintStrength
+// (0..1) so that a translucent window is read against a predictable dark
+// surface whatever the wallpaper or the windows behind it look like.
+static QMatrix4x4 colorTransformMatrix(qreal saturation, qreal contrast, qreal brightness, const QColor &tintColor, qreal tintStrength)
 {
     QMatrix4x4 saturationMatrix;
     QMatrix4x4 contrastMatrix;
+    QMatrix4x4 brightnessMatrix;
+    QMatrix4x4 tintMatrix;
+
+    if (!qFuzzyCompare(brightness, 1.0)) {
+        brightnessMatrix.scale(brightness, brightness, brightness);
+    }
+
+    if (tintStrength > 0.0 && tintColor.isValid()) {
+        const qreal t = std::clamp(tintStrength, 0.0, 1.0);
+        const qreal keep = 1.0 - t;
+        tintMatrix = QMatrix4x4(keep, 0.0, 0.0, 0.0,
+                                0.0, keep, 0.0, 0.0,
+                                0.0, 0.0, keep, 0.0,
+                                tintColor.redF() * t, tintColor.greenF() * t, tintColor.blueF() * t, 1.0);
+    }
 
     if (!qFuzzyCompare(saturation, 1.0)) {
         const qreal rval = (1.0 - saturation) * 0.2126;
@@ -82,7 +104,8 @@ static QMatrix4x4 colorTransformMatrix(qreal saturation, qreal contrast)
                                     transl, transl, transl, 1.0);
     }
 
-    return contrastMatrix * saturationMatrix;
+    // Row-vector order: brightness, then saturation, then contrast, then the tint last.
+    return brightnessMatrix * saturationMatrix * contrastMatrix * tintMatrix;
 }
 
 BlurEffect::BlurEffect()
@@ -251,14 +274,44 @@ void BlurEffect::reconfigure(ReconfigureFlags flags)
 {
     BlurConfig::self()->read();
 
-    int blurStrength = BlurConfig::blurStrength() - 1;
+    // A hand-edited kwinrc must not be able to index past the table.
+    const int blurStrength = std::clamp(BlurConfig::blurStrength() - 1, 0, int(blurStrengthValues.size()) - 1);
     m_iterationCount = blurStrengthValues[blurStrength].iteration;
     m_offset = blurStrengthValues[blurStrength].offset;
     m_expandSize = blurOffsets[m_iterationCount - 1].expandSize;
-    m_noiseStrength = BlurConfig::noiseStrength();
-    m_colorMatrix = colorTransformMatrix(BlurConfig::saturation() / 100.0, 1.0);
+    m_noiseStrength = std::max(0, BlurConfig::noiseStrength());
+    m_colorMatrix = colorTransformMatrix(BlurConfig::saturation() / 100.0,
+                                         BlurConfig::contrast() / 100.0,
+                                         BlurConfig::brightness() / 100.0,
+                                         BlurConfig::tintColor(),
+                                         BlurConfig::tintStrength() / 100.0);
+
+    m_forceBlur = BlurConfig::forceBlur();
+    m_forceBlurDecorations = BlurConfig::forceBlurDecorations();
+    m_forceBlurMenus = BlurConfig::forceBlurMenus();
+    m_forceBlurDocks = BlurConfig::forceBlurDocks();
+    m_excludeClasses.clear();
+    const QStringList excluded = BlurConfig::excludeClasses().split(QLatin1Char(','), Qt::SkipEmptyParts);
+    for (const QString &cls : excluded) {
+        if (const QString trimmed = cls.trimmed(); !trimmed.isEmpty()) {
+            m_excludeClasses.append(trimmed);
+        }
+    }
+    m_cornerRadius = std::max(0, BlurConfig::cornerRadius());
+
     for (auto &[window, data] : m_windows) {
         data.blurItem->setPixelsToExpandRepaintsBelowOpaqueRegions(m_expandSize);
+    }
+
+    // The force-blur settings decide which windows have a blur region at
+    // all, so every window is re-evaluated -- not just the ones already
+    // tracked. m_valid is false while the constructor is still running;
+    // it fetches the stacking order itself once everything is wired up.
+    if (m_valid) {
+        const auto stackingOrder = effects->stackingOrder();
+        for (EffectWindow *window : stackingOrder) {
+            updateBlurRegion(window);
+        }
     }
 
     // Update all windows for the blur to take effect
@@ -309,6 +362,24 @@ void BlurEffect::updateBlurRegion(EffectWindow *w)
 
     if (w->decorationHasAlpha() && decorationSupportsBlurBehind(w)) {
         frame = decorationBlurRegion(w);
+    }
+
+    // HoltOS: blur behind every eligible window, not only the ones that
+    // asked. A window that did ask keeps its own (possibly partial) region;
+    // an empty region means "the whole window" to blurRegion().
+    if (m_forceBlur && shouldForceBlur(w)) {
+        if (!content.has_value()) {
+            content = RegionF();
+        }
+        // Deliberately not gated on decorationHasAlpha(): a decoration can
+        // report itself as opaque even when its title bar is painted with
+        // some transparency, which would otherwise silently skip blurring
+        // behind a translucent titlebar. Blurring under a truly opaque
+        // frame costs a little and shows nothing; not blurring under a
+        // translucent one is the bug.
+        if (m_forceBlurDecorations && !frame.has_value() && w->decoration()) {
+            frame = RegionF(w->decoration()->rect()) - w->contentsRect();
+        }
     }
 
     if (content.has_value() || frame.has_value()) {
@@ -500,6 +571,31 @@ bool BlurEffect::shouldBlur(const EffectWindow *w, int mask, const WindowPaintDa
         return false;
     }
 
+    return true;
+}
+
+bool BlurEffect::shouldForceBlur(const EffectWindow *w) const
+{
+    // Never: the desktop (nothing behind it), the lock screen, drag icons,
+    // input methods, windows on their way out.
+    if (w->isDesktop() || w->isLockScreen() || w->isDNDIcon() || w->isInputMethod() || w->isDeleted()) {
+        return false;
+    }
+    if (w->isDock() && !m_forceBlurDocks) {
+        return false;
+    }
+    if (!m_forceBlurMenus && (w->isMenu() || w->isDropdownMenu() || w->isPopupMenu() || w->isComboBox() || w->isTooltip())) {
+        return false;
+    }
+    // windowClass() is "<resource name> <resource class>"; match either.
+    if (!m_excludeClasses.isEmpty()) {
+        const QStringList parts = w->windowClass().split(QLatin1Char(' '), Qt::SkipEmptyParts);
+        for (const QString &part : parts) {
+            if (m_excludeClasses.contains(part, Qt::CaseInsensitive)) {
+                return false;
+            }
+        }
+    }
     return true;
 }
 
@@ -797,7 +893,18 @@ void BlurEffect::blur(const RenderTarget &renderTarget, const RenderViewport &vi
 
     const float modulation = opacity * opacity;
 
-    if (const BorderRadius cornerRadius = w->window()->borderRadius(); !cornerRadius.isNull()) {
+    // A server-side decoration (ours) tells KWin its corner radius and the
+    // blur follows it. Windows without one -- client-side decorated apps --
+    // get the configured HoltOS radius instead, unless they fill the
+    // screen, where square corners are right.
+    BorderRadius cornerRadius = w->window()->borderRadius();
+    if (cornerRadius.isNull() && m_cornerRadius > 0 && !w->decoration() && !w->isFullScreen()
+        && (w->isNormalWindow() || w->isDialog() || w->isUtility())
+        && w->window()->maximizeMode() == MaximizeRestore) {
+        cornerRadius = BorderRadius(m_cornerRadius);
+    }
+
+    if (!cornerRadius.isNull()) {
         ShaderManager::instance()->pushShader(m_roundedOnscreenPass.shader.get());
 
         QMatrix4x4 projectionMatrix = viewport.projectionMatrix();

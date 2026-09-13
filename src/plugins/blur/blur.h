@@ -12,6 +12,7 @@
 #include "scene/item.h"
 
 #include <QList>
+#include <QStringList>
 
 #include <unordered_map>
 
@@ -87,6 +88,8 @@ private:
     RegionF decorationBlurRegion(const EffectWindow *w) const;
     bool decorationSupportsBlurBehind(const EffectWindow *w) const;
     bool shouldBlur(const EffectWindow *w, int mask, const WindowPaintData &data) const;
+    /// HoltOS: whether a window that did not ask for blur gets it anyway.
+    bool shouldForceBlur(const EffectWindow *w) const;
     void updateBlurRegion(EffectWindow *w);
     void blur(const RenderTarget &renderTarget, const RenderViewport &viewport, EffectWindow *w, int mask, const Region &deviceRegion, WindowPaintData &data);
     GLTexture *ensureNoiseTexture();
@@ -151,6 +154,14 @@ private:
     int m_offset;
     int m_expandSize;
     int m_noiseStrength;
+
+    // HoltOS Glass settings (see blur.kcfg).
+    bool m_forceBlur = true;
+    bool m_forceBlurDecorations = true;
+    bool m_forceBlurMenus = true;
+    bool m_forceBlurDocks = false;
+    QStringList m_excludeClasses;
+    int m_cornerRadius = 0;
 
     struct OffsetStruct
     {
