@@ -667,7 +667,15 @@ void BlurEffect::blur(const RenderTarget &renderTarget, const RenderViewport &vi
 
     blurShape.translate(w->pos());
 
-    const Rect backgroundRect = blurShape.boundingRect().rounded();
+    // HoltOS: only the part of the window inside this output is ever copied into the
+    // offscreen textures (deviceRegion is clipped to the output), so size them from
+    // that part. Sized from the whole window, the texels past the screen edge stayed
+    // unwritten (transparent, or stale from earlier frames) and the dual Kawase passes
+    // smeared them into the visible glass: the "glass breaks near the edge" bug.
+    const Rect backgroundRect = blurShape.boundingRect().intersected(viewport.renderRect()).rounded();
+    if (backgroundRect.isEmpty()) {
+        return;
+    }
     const Rect scaledBackgroundRect = backgroundRect.scaled(viewport.scale()).rounded();
     const Rect deviceBackgroundRect = viewport.mapToDeviceCoordinates(backgroundRect).rounded();
     const auto opacity = w->opacity() * data.opacity();
@@ -687,7 +695,10 @@ void BlurEffect::blur(const RenderTarget &renderTarget, const RenderViewport &vi
         }
     } else {
         for (const RectF &rect : blurShape.rects()) {
-            effectiveShape.append(rect.translated(-backgroundRect.topLeft()).scaled(viewport.scale()).rounded());
+            const RectF clipped = rect.intersected(RectF(backgroundRect));
+            if (!clipped.isEmpty()) {
+                effectiveShape.append(clipped.translated(-backgroundRect.topLeft()).scaled(viewport.scale()).rounded());
+            }
         }
     }
     if (effectiveShape.isEmpty()) {
