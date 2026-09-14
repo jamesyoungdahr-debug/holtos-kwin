@@ -672,10 +672,28 @@ void BlurEffect::blur(const RenderTarget &renderTarget, const RenderViewport &vi
     // that part. Sized from the whole window, the texels past the screen edge stayed
     // unwritten (transparent, or stale from earlier frames) and the dual Kawase passes
     // smeared them into the visible glass: the "glass breaks near the edge" bug.
-    const Rect backgroundRect = blurShape.boundingRect().intersected(viewport.renderRect()).rounded();
-    if (backgroundRect.isEmpty()) {
+    //
+    // That part changes size on every frame while a window crosses an edge, which
+    // reallocated the textures every frame and let the downsample passes round odd
+    // sizes differently from frame to frame, so the glass flickered and showed a line
+    // at the edge (Liam, 2026-09-14). Grow the rect to a multiple of 2^iterations,
+    // centred on the visible part and clamped to the output (so it grows away from
+    // the output edges): its size now changes only in steps and every pass halves it
+    // exactly. The extra pixels are real screen content next to the window.
+    const Rect outputRect = viewport.renderRect().rounded();
+    const Rect visibleRect = blurShape.boundingRect().rounded().intersected(outputRect);
+    if (visibleRect.isEmpty()) {
         return;
     }
+    const int sizeStep = 1 << m_iterationCount;
+    const auto growToStep = [sizeStep](int start, int length, int outputStart, int outputLength) {
+        const int wanted = std::min(((length + sizeStep - 1) / sizeStep) * sizeStep, outputLength);
+        const int newStart = std::clamp(start - (wanted - length) / 2, outputStart, outputStart + outputLength - wanted);
+        return std::pair<int, int>(newStart, wanted);
+    };
+    const auto [backgroundX, backgroundWidth] = growToStep(visibleRect.left(), visibleRect.width(), outputRect.left(), outputRect.width());
+    const auto [backgroundY, backgroundHeight] = growToStep(visibleRect.top(), visibleRect.height(), outputRect.top(), outputRect.height());
+    const Rect backgroundRect(backgroundX, backgroundY, backgroundWidth, backgroundHeight);
     const Rect scaledBackgroundRect = backgroundRect.scaled(viewport.scale()).rounded();
     const Rect deviceBackgroundRect = viewport.mapToDeviceCoordinates(backgroundRect).rounded();
     const auto opacity = w->opacity() * data.opacity();
@@ -724,7 +742,10 @@ void BlurEffect::blur(const RenderTarget &renderTarget, const RenderViewport &vi
                 return;
             }
             texture->setFilter(GL_LINEAR);
-            texture->setWrapMode(GL_CLAMP_TO_EDGE);
+            // HoltOS: mirror at the texture edge instead of repeating the last row or
+            // column, so a blur that reaches the screen edge fades into a reflection of
+            // itself rather than smearing a line of edge pixels (Liam, 2026-09-14).
+            texture->setWrapMode(GL_MIRRORED_REPEAT);
 
             auto framebuffer = std::make_unique<GLFramebuffer>(texture.get());
             if (!framebuffer->valid()) {
