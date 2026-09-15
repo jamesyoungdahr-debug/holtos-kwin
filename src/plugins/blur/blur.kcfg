@@ -58,5 +58,17 @@
         <entry name="CornerRadius" type="Int">
             <default>12</default>
         </entry>
+        <!-- HoltOS adaptive contrast: darken the blurred backdrop locally
+             where it is brighter than AdaptiveMaxLuminance (percent of full
+             white, in linear light), so light text over glass stays readable
+             on bright wallpapers. Off until tested on hardware. -->
+        <entry name="AdaptiveContrast" type="Bool">
+            <default>false</default>
+        </entry>
+        <entry name="AdaptiveMaxLuminance" type="Int">
+            <default>30</default>
+            <min>5</min>
+            <max>100</max>
+        </entry>
     </group>
 </kcfg>

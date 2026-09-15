@@ -124,6 +124,8 @@ BlurEffect::BlurEffect()
         m_onscreenPass.colorMatrixLocation = m_onscreenPass.shader->uniformLocation("colorMatrix");
         m_onscreenPass.offsetLocation = m_onscreenPass.shader->uniformLocation("offset");
         m_onscreenPass.halfpixelLocation = m_onscreenPass.shader->uniformLocation("halfpixel");
+        m_onscreenPass.backdropTexUnitLocation = m_onscreenPass.shader->uniformLocation("backdropTexUnit");
+        m_onscreenPass.adaptiveMaxLuminanceLocation = m_onscreenPass.shader->uniformLocation("adaptiveMaxLuminance");
     }
 
     m_roundedOnscreenPass.shader = ShaderManager::instance()->generateShaderFromFile(ShaderTrait::MapTexture,
@@ -140,6 +142,8 @@ BlurEffect::BlurEffect()
         m_roundedOnscreenPass.boxLocation = m_roundedOnscreenPass.shader->uniformLocation("box");
         m_roundedOnscreenPass.cornerRadiusLocation = m_roundedOnscreenPass.shader->uniformLocation("cornerRadius");
         m_roundedOnscreenPass.opacityLocation = m_roundedOnscreenPass.shader->uniformLocation("opacity");
+        m_roundedOnscreenPass.backdropTexUnitLocation = m_roundedOnscreenPass.shader->uniformLocation("backdropTexUnit");
+        m_roundedOnscreenPass.adaptiveMaxLuminanceLocation = m_roundedOnscreenPass.shader->uniformLocation("adaptiveMaxLuminance");
     }
 
     m_downsamplePass.shader = ShaderManager::instance()->generateShaderFromFile(ShaderTrait::MapTexture,
@@ -298,6 +302,9 @@ void BlurEffect::reconfigure(ReconfigureFlags flags)
         }
     }
     m_cornerRadius = std::max(0, BlurConfig::cornerRadius());
+    m_adaptiveMaxLuminance = BlurConfig::adaptiveContrast()
+        ? std::clamp(BlurConfig::adaptiveMaxLuminance(), 5, 100) / 100.0f
+        : 0.0f;
 
     for (auto &[window, data] : m_windows) {
         data.blurItem->setPixelsToExpandRepaintsBelowOpaqueRegions(m_expandSize);
@@ -967,6 +974,17 @@ void BlurEffect::blur(const RenderTarget &renderTarget, const RenderViewport &vi
         m_roundedOnscreenPass.shader->setUniform(m_roundedOnscreenPass.boxLocation, QVector4D(nativeBox.horizontalCenter(), nativeBox.verticalCenter(), nativeBox.width() * 0.5, nativeBox.height() * 0.5));
         m_roundedOnscreenPass.shader->setUniform(m_roundedOnscreenPass.cornerRadiusLocation, nativeCornerRadius.toVector());
         m_roundedOnscreenPass.shader->setUniform(m_roundedOnscreenPass.opacityLocation, modulation);
+        m_roundedOnscreenPass.shader->setUniform(m_roundedOnscreenPass.adaptiveMaxLuminanceLocation, m_adaptiveMaxLuminance);
+        m_roundedOnscreenPass.shader->setUniform(m_roundedOnscreenPass.backdropTexUnitLocation, 1);
+        GLTexture *backdrop = nullptr;
+        if (m_adaptiveMaxLuminance > 0.0f) {
+            // HoltOS adaptive contrast: the smallest blur level, which the
+            // upsample passes never write to, on texture unit 1.
+            backdrop = renderInfo.framebuffers[m_iterationCount]->colorAttachment();
+            glActiveTexture(GL_TEXTURE1);
+            backdrop->bind();
+            glActiveTexture(GL_TEXTURE0);
+        }
 
         read->colorAttachment()->bind();
 
@@ -976,6 +994,12 @@ void BlurEffect::blur(const RenderTarget &renderTarget, const RenderViewport &vi
         vbo->draw(GL_TRIANGLES, 6, vertexCount);
 
         glDisable(GL_BLEND);
+
+        if (backdrop) {
+            glActiveTexture(GL_TEXTURE1);
+            backdrop->unbind();
+            glActiveTexture(GL_TEXTURE0);
+        }
 
         ShaderManager::instance()->popShader();
     } else {
@@ -994,6 +1018,16 @@ void BlurEffect::blur(const RenderTarget &renderTarget, const RenderViewport &vi
         m_onscreenPass.shader->setUniform(m_onscreenPass.colorMatrixLocation, m_colorMatrix);
         m_onscreenPass.shader->setUniform(m_onscreenPass.halfpixelLocation, halfpixel);
         m_onscreenPass.shader->setUniform(m_onscreenPass.offsetLocation, float(m_offset));
+        m_onscreenPass.shader->setUniform(m_onscreenPass.adaptiveMaxLuminanceLocation, m_adaptiveMaxLuminance);
+        m_onscreenPass.shader->setUniform(m_onscreenPass.backdropTexUnitLocation, 1);
+        GLTexture *backdrop = nullptr;
+        if (m_adaptiveMaxLuminance > 0.0f) {
+            // HoltOS adaptive contrast (see the rounded pass above).
+            backdrop = renderInfo.framebuffers[m_iterationCount]->colorAttachment();
+            glActiveTexture(GL_TEXTURE1);
+            backdrop->bind();
+            glActiveTexture(GL_TEXTURE0);
+        }
 
         read->colorAttachment()->bind();
 
@@ -1007,6 +1041,12 @@ void BlurEffect::blur(const RenderTarget &renderTarget, const RenderViewport &vi
 
         if (modulation < 1.0) {
             glDisable(GL_BLEND);
+        }
+
+        if (backdrop) {
+            glActiveTexture(GL_TEXTURE1);
+            backdrop->unbind();
+            glActiveTexture(GL_TEXTURE0);
         }
 
         ShaderManager::instance()->popShader();

@@ -102,6 +102,8 @@ private:
         int colorMatrixLocation;
         int offsetLocation;
         int halfpixelLocation;
+        int backdropTexUnitLocation;
+        int adaptiveMaxLuminanceLocation;
     } m_onscreenPass;
 
     struct
@@ -114,6 +116,8 @@ private:
         int boxLocation;
         int cornerRadiusLocation;
         int opacityLocation;
+        int backdropTexUnitLocation;
+        int adaptiveMaxLuminanceLocation;
     } m_roundedOnscreenPass;
 
     struct
@@ -162,6 +166,8 @@ private:
     bool m_forceBlurDocks = false;
     QStringList m_excludeClasses;
     int m_cornerRadius = 0;
+    /// HoltOS adaptive contrast target luminance (0..1); 0 = off.
+    float m_adaptiveMaxLuminance = 0.0f;
 
     struct OffsetStruct
     {
